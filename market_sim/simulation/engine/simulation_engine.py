@@ -16,6 +16,8 @@ import logging
 from core.models.base import Order, Trade, Asset
 from market.exchange.matching_engine import MatchingEngine
 from market.agents.base_agent import BaseAgent
+from market_sim.blockchain.consensus import RaftCluster, CommitListener
+
 
 class SimulationEvent:
     def __init__(self, timestamp: datetime, event_type: str, data: Any):
@@ -46,11 +48,17 @@ class MarketSimulation:
         
         # Results collection
         self.trades: List[Trade] = []
+        self.consensus_trades = []
         self.metrics: Dict[str, List[Dict]] = {
             'order_book_snapshots': [],
             'agent_metrics': [],
             'market_metrics': []
         }
+
+        # ---- Raft cluster for distributed consensus ---------------------------
+        self.raft = RaftCluster.make_demo_cluster(5)
+        self.raft.register_listener(self._on_raft_commit)
+        self.time_step_ms = int(self.time_step.total_seconds() * 1000)
         
         # Setup logging
         self.logger = logging.getLogger(__name__)
@@ -93,7 +101,9 @@ class MarketSimulation:
         """Notify all agents of a trade."""
         for agent in self.agents.values():
             agent.on_trade(trade)
-    
+        # Commit the trade via Raft leader
+        self.raft.commit_command(trade)
+
     def _update_order_books(self) -> None:
         """Update order book snapshots and notify agents."""
         for symbol, exchange in self.exchanges.items():
@@ -163,7 +173,10 @@ class MarketSimulation:
             # Update order books and collect metrics
             self._update_order_books()
             self._collect_metrics()
-            
+
+            # Advance Raft clock
+            self.raft.tick(self.time_step_ms)
+
             # Advance time
             self.current_time += self.time_step
         
@@ -214,4 +227,9 @@ class MarketSimulation:
                     for agent_id, agent in self.agents.items()
                 }
             }
-        } 
+        }
+
+    # ---------------------------------------------------------------- Raft glue
+    def _on_raft_commit(self, term: int, index: int, command: Any) -> None:
+        if isinstance(command, Trade):  # commit only Trade objects for now
+            self.consensus_trades.append(command)
